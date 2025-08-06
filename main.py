@@ -1,170 +1,238 @@
-import telebot
-import os
-import json
-from uuid import uuid4
-from flask import Flask
-from threading import Thread
+import json, os, requests, logging
+from telebot import TeleBot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-# === CONFIG ===
-BOT_TOKEN = "7853004642:AAFreF83_Pc5lBRE2MPF3rhUC_KGJpCgZsY"
-ADMIN_ID = 6684769651
-CHANNEL_URL = "https://t.me/+iOn8K6DHhMk3ODA1"
-FILES_PATH = "files.json"
-USERS_PATH = "users.json"
+# ------------ CONFIG ------------
+BOT_TOKEN = "7853004642:AAFrR1gGwlxdn7m2VNA3UhVBnrIdBrfatYQ"
+API_URL = "https://numinfoapi.zerovault.workers.dev/search/mobile?value="
+ADMIN_USERNAME = "@XPRO_BEASTY_BOT"
+ADMINS = [6684769651]
+BOT_USERNAME = "OSINT_XPRO_BOT"
+USER_DATA_FILE = "users.json"
 
-bot = telebot.TeleBot(BOT_TOKEN)
+# ------------ LOGGING ------------
+logging.basicConfig(level=logging.INFO)
 
-# === UTIL FUNCTIONS (storage, delete, export, etc.) ===
-def load_json(path):
-    if not os.path.exists(path):
-        with open(path, 'w') as f:
-            json.dump({}, f)
-    with open(path, 'r') as f:
-        return json.load(f)
-def save_json(path, data):
-    with open(path, 'w') as f:
+# ------------ INIT BOT ------------
+bot = TeleBot(BOT_TOKEN)
+admin_states = {}
+
+# ------------ USER DATABASE ------------
+def load_user_data():
+    if os.path.exists(USER_DATA_FILE):
+        with open(USER_DATA_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+def save_user_data(data):
+    with open(USER_DATA_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
-def add_user(uid):
-    users = load_json(USERS_PATH)
-    if str(uid) not in users:
-        users[str(uid)] = True
-        save_json(USERS_PATH, users)
-def get_user_count():
-    return len(load_json(USERS_PATH))
-def save_file(ftype, fid, owner, cap):
-    db = load_json(FILES_PATH)
-    key = str(uuid4())
-    db[key] = {"type": ftype, "file_id": fid, "owner": owner, "caption": cap or ""}
-    save_json(FILES_PATH, db)
-    return key
-def get_file(key): return load_json(FILES_PATH).get(key)
-def delete_user_file(owner, key):
-    db = load_json(FILES_PATH)
-    if key in db and db[key]["owner"] == owner:
-        del db[key]; save_json(FILES_PATH, db); return True
-    return False
-def get_user_files(uid):
-    db = load_json(FILES_PATH)
-    return {k: v for k, v in db.items() if v["owner"] == uid}
-def join_markup():
-    kb = InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton("📢 Join Channel", url=CHANNEL_URL))
-    return kb
-def admin_markup():
-    kb = InlineKeyboardMarkup()
-    kb.row(InlineKeyboardButton("📣 Broadcast", callback_data="broadcast"),
-           InlineKeyboardButton("👥 Users", callback_data="users"),
-           InlineKeyboardButton("📤 Export", callback_data="export"))
-    return kb
 
-# === BOT HANDLERS ===
+def get_user(uid, username=None, full_name=None):
+    data = load_user_data()
+    key = str(uid)
+    if key not in data:
+        data[key] = {
+            "credits": 3,
+            "referral": None,
+            "ref_count": 0,
+            "username": username or "",
+            "name": full_name or "",
+        }
+        save_user_data(data)
+    else:
+        changed = False
+        if username and data[key].get("username") != username:
+            data[key]["username"] = username
+            changed = True
+        if full_name and data[key].get("name") != full_name:
+            data[key]["name"] = full_name
+            changed = True
+        if changed:
+            save_user_data(data)
+    return data[key]
+
+def update_user(uid, userinfo):
+    data = load_user_data()
+    data[str(uid)] = userinfo
+    save_user_data(data)
+
+# ------------ MENUS ------------
+def is_admin(user_id):
+    return user_id in ADMINS
+
+def main_menu(user_id):
+    markup = InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        InlineKeyboardButton("📞 Lookup", callback_data="osint"),
+        InlineKeyboardButton("💰 Pricing", callback_data="pricing"),
+        InlineKeyboardButton("👤 Profile", callback_data="profile"),
+        InlineKeyboardButton("🎁 Refer & Earn", callback_data="refer"),
+    )
+    markup.add(InlineKeyboardButton("👨‍💻 Contact Admin", url=f"https://t.me/{ADMIN_USERNAME.lstrip('@')}"))
+    if is_admin(user_id):
+        markup.add(InlineKeyboardButton("🛠 Admin", callback_data="admin_menu"))
+    return markup
+
+def admin_menu():
+    markup = InlineKeyboardMarkup(row_width=1)
+    markup.add(
+        InlineKeyboardButton("🔍 Find User", callback_data="admin_find_user"),
+        InlineKeyboardButton("➕ Add Credits", callback_data="admin_add_credits"),
+        InlineKeyboardButton("➖ Remove Credits", callback_data="admin_remove_credits"),
+        InlineKeyboardButton("📢 Broadcast", callback_data="admin_broadcast"),
+        InlineKeyboardButton("⬅ Back", callback_data="back_to_main"),
+    )
+    return markup
+
+# ------------ START COMMAND ------------
 @bot.message_handler(commands=["start"])
-def cmd_start(m):
-    add_user(m.from_user.id)
-    args = m.text.split()
-    if len(args) > 1 and args[1].startswith("dl_"):
-        key = args[1][3:]; f = get_file(key)
-        if f:
+def start_handler(message):
+    user_id = message.from_user.id
+    user = get_user(user_id, message.from_user.username, message.from_user.full_name)
+    args = message.text.strip().split()
+
+    if len(args) > 1 and args[1].startswith("_ref_"):
+        ref_id = int(args[1].replace("_ref_", ""))
+        if user["referral"] is None and ref_id != user_id:
+            user["referral"] = ref_id
+            user["credits"] += 3
+            ref_user = get_user(ref_id)
+            ref_user["credits"] += 3
+            ref_user["ref_count"] += 1
+            update_user(user_id, user)
+            update_user(ref_id, ref_user)
             try:
-                cap = f.get("caption", "")
-                if f["type"]=="photo": bot.send_photo(m.chat.id, f["file_id"], caption=cap)
-                elif f["type"]=="video": bot.send_video(m.chat.id, f["file_id"], caption=cap)
-                else: bot.send_document(m.chat.id, f["file_id"], caption=cap)
-            except: bot.send_message(m.chat.id, "❌ Failed to send")
-        else: bot.send_message(m.chat.id, "❌ File not found")
-        return
-    bot.send_message(m.chat.id,
-        "👋 Welcome!\nSend any media to get a share link.\nUse /myfiles for list.",
-        reply_markup=join_markup())
+                bot.send_message(ref_id, f"🎉 @{user['username']} joined with your referral! +3 credits.")
+            except:
+                pass
 
-@bot.message_handler(commands=["myfiles"])
-def cmd_myfiles(m):
-    lst = get_user_files(m.from_user.id)
-    if not lst:
-        bot.send_message(m.chat.id, "📭 No uploads yet.")
+    bot.send_message(user_id, "Welcome to *HACKY-X-PRO*\nUse the menu below.", parse_mode="Markdown", reply_markup=main_menu(user_id))
+
+# ------------ CALLBACK HANDLER ------------
+@bot.callback_query_handler(func=lambda call: True)
+def callback_handler(call):
+    user_id = call.from_user.id
+    data = call.data
+    user = get_user(user_id)
+
+    if data == "osint":
+        if user["credits"] < 1:
+            bot.send_message(call.message.chat.id, "❌ You have 0 credits.")
+        else:
+            bot.send_message(call.message.chat.id, "📞 Send a mobile number:")
+
+    elif data == "pricing":
+        bot.send_message(call.message.chat.id, "*Credits:* 12=₹59 | 30=₹109 | 75=₹229\nContact admin to buy.", parse_mode="Markdown")
+
+    elif data == "profile":
+        msg = f"<b>Name:</b> {user['name']}\n<b>Username:</b> @{user['username']}\n<b>Credits:</b> {user['credits']}\n<b>Referrals:</b> {user['ref_count']}"
+        bot.send_message(call.message.chat.id, msg, parse_mode="HTML")
+
+    elif data == "refer":
+        ref = f"https://t.me/{BOT_USERNAME}?start=_ref_{user_id}"
+        bot.send_message(call.message.chat.id, f"<b>Refer link:</b> {ref}\nInvite & earn +3 credits!", parse_mode="HTML")
+
+    elif data == "admin_menu" and is_admin(user_id):
+        bot.edit_message_text("Admin Panel", call.message.chat.id, call.message.message_id, reply_markup=admin_menu())
+
+    elif data == "back_to_main":
+        bot.edit_message_text("Main Menu", call.message.chat.id, call.message.message_id, reply_markup=main_menu(user_id))
+
+    elif data == "admin_find_user":
+        msg = bot.send_message(call.message.chat.id, "Send user ID or @username:")
+        admin_states[user_id] = "find"
+        bot.register_next_step_handler(msg, admin_find_user)
+
+    elif data == "admin_add_credits":
+        msg = bot.send_message(call.message.chat.id, "Send: user_id credits")
+        admin_states[user_id] = "add"
+        bot.register_next_step_handler(msg, admin_add_credits)
+
+    elif data == "admin_remove_credits":
+        msg = bot.send_message(call.message.chat.id, "Send: user_id credits")
+        admin_states[user_id] = "remove"
+        bot.register_next_step_handler(msg, admin_remove_credits)
+
+    elif data == "admin_broadcast":
+        msg = bot.send_message(call.message.chat.id, "Send broadcast message:")
+        admin_states[user_id] = "broadcast"
+        bot.register_next_step_handler(msg, admin_broadcast)
+
+# ------------ ADMIN FUNCTIONS ------------
+def admin_find_user(msg):
+    key = msg.text.strip().lstrip("@")
+    data = load_user_data()
+    found = None
+    if key.isdigit():
+        found = data.get(key)
     else:
-        txt = "🗂 Your files:\n"
-        for k,v in lst.items():
-            preview = f"📝 {v['caption'][:30]}..." if v['caption'] else "📁 No title"
-            txt += f"{preview}\n/start dl_{k}\n/delete {k}\n\n"
-        bot.send_message(m.chat.id, txt)
+        for uid, u in data.items():
+            if u.get("username", "") == key:
+                key, found = uid, u
+                break
+    if found:
+        bot.send_message(msg.chat.id, f"<b>User:</b> {key}\n<b>Credits:</b> {found['credits']}", parse_mode="HTML")
+    else:
+        bot.send_message(msg.chat.id, "User not found.")
+    admin_states.pop(msg.from_user.id, None)
 
-@bot.message_handler(commands=["delete"])
-def cmd_delete(m):
-    parts = m.text.split()
-    if len(parts)!=2:
-        bot.send_message(m.chat.id, "Usage: /delete <file_id>")
-        return
-    ok = delete_user_file(m.from_user.id, parts[1])
-    bot.send_message(m.chat.id,
-        "✅ Deleted." if ok else "❌ Cannot delete.")
+def admin_add_credits(msg):
+    try:
+        uid, amt = msg.text.strip().split()
+        data = load_user_data()
+        data[uid]["credits"] += int(amt)
+        save_user_data(data)
+        bot.send_message(msg.chat.id, "✅ Added credits.")
+    except:
+        bot.send_message(msg.chat.id, "❌ Error.")
+    admin_states.pop(msg.from_user.id, None)
 
-@bot.message_handler(commands=["admin"])
-def cmd_admin(m):
-    if m.from_user.id == ADMIN_ID:
-        bot.send_message(m.chat.id, "⚙️ Admin Panel", reply_markup=admin_markup())
+def admin_remove_credits(msg):
+    try:
+        uid, amt = msg.text.strip().split()
+        data = load_user_data()
+        data[uid]["credits"] = max(0, data[uid]["credits"] - int(amt))
+        save_user_data(data)
+        bot.send_message(msg.chat.id, "✅ Removed credits.")
+    except:
+        bot.send_message(msg.chat.id, "❌ Error.")
+    admin_states.pop(msg.from_user.id, None)
 
-@bot.callback_query_handler(func=lambda c: True)
-def cb(c):
-    if c.message.chat.id != ADMIN_ID: return
-    if c.data=="broadcast":
-        msg = bot.send_message(c.message.chat.id, "📣 Now send broadcast:")
-        bot.register_next_step_handler(msg, handle_broadcast)
-    elif c.data=="users":
-        bot.send_message(c.message.chat.id, f"👥 {get_user_count()} users")
-    elif c.data=="export":
-        export_all(c.message.chat.id)
-
-def handle_broadcast(m):
-    us = load_json(USERS_PATH); cnt = 0
-    for uid in us:
+def admin_broadcast(msg):
+    text = msg.text
+    count = 0
+    data = load_user_data()
+    for uid in data:
         try:
-            if m.content_type=="text":
-                bot.send_message(uid, m.text)
-            elif m.content_type=="photo":
-                bot.send_photo(uid, m.photo[-1].file_id, caption=m.caption or "")
-            elif m.content_type=="video":
-                bot.send_video(uid, m.video.file_id, caption=m.caption or "")
-            elif m.content_type=="document":
-                bot.send_document(uid, m.document.file_id, caption=m.caption or "")
-            cnt+=1
-        except: pass
-    bot.send_message(ADMIN_ID, f"✅ Sent to {cnt} users")
+            bot.send_message(int(uid), text)
+            count += 1
+        except:
+            pass
+    bot.send_message(msg.chat.id, f"✅ Broadcast sent to {count} users.")
+    admin_states.pop(msg.from_user.id, None)
 
-def export_all(admin_chat):
-    us = load_json(USERS_PATH); fs = load_json(FILES_PATH)
-    with open("users_export.txt","w") as f:
-        f.write(f"Users: {len(us)}\n"+ "\n".join(us.keys()))
-    lines=[]
-    for k,v in fs.items():
-        cap=v.get("caption","").replace("\n"," ")[:50]
-        link=f"https://t.me/{bot.get_me().username}?start=dl_{k}"
-        lines.append(f"ID:{k} Type:{v['type']} Owner:{v['owner']} Cap:{cap} Link:{link}")
-    with open("files_export.txt","w", encoding="utf8") as f:
-        f.write("\n".join(lines))
-    bot.send_document(admin_chat, open("users_export.txt","rb"), caption="Users list")
-    bot.send_document(admin_chat, open("files_export.txt","rb"), caption="Files list")
+# ------------ HANDLE NUMBER INPUT ------------
+@bot.message_handler(func=lambda m: m.text.isdigit() and len(m.text) >= 7)
+def handle_number(message):
+    user = get_user(message.from_user.id)
+    if user["credits"] < 1:
+        bot.send_message(message.chat.id, "❌ Not enough credits.")
+        return
+    try:
+        r = requests.get(API_URL + message.text)
+        result = r.text if r.status_code == 200 else "❌ API error."
+    except Exception as e:
+        result = f"⚠ Error: {e}"
+    user["credits"] -= 1
+    update_user(message.from_user.id, user)
+    bot.send_message(message.chat.id, f"🔍 Info for {message.text}:\n\n{result}")
 
-@bot.message_handler(content_types=["photo","video","document"])
-def handle_media(m):
-    add_user(m.from_user.id)
-    if m.photo:
-        fid = m.photo[-1].file_id; ftype="photo"
-    elif m.video:
-        fid = m.video.file_id; ftype="video"
-    else:
-        fid = m.document.file_id; ftype="document"
-    cap = m.caption or ""
-    key = save_file(ftype, fid, m.from_user.id, cap)
-    bot.reply_to(m, f"✅ Saved!\nLink: https://t.me/{bot.get_me().username}?start=dl_{key}")
-
-# === KEEP‑ALIVE WEB SERVER ===
-app = Flask('')
-@app.route('/')
-def home(): return "I'm alive!"
-def run(): app.run(host='0.0.0.0', port=8080)
-Thread(target=run).start()
-
-# === START BOT ===
-bot.infinity_polling()
+# ------------ RUN BOT SAFELY ------------
+while True:
+    try:
+        logging.info("🤖 Bot running...")
+        bot.remove_webhook()
+        bot.infinity_polling()
+    except Exception as e:
+        logging.error(f"❌ Crash: {e}")
